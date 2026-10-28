@@ -41,7 +41,13 @@ cross-validation folds to avoid data leakage.
 
 ## Files
 - `pima_diabetes_analysis.Rmd`: full R Markdown source code
-- `Statistical_Analysis_Predictive_Modeling.docx`: final report
+- `Statistical_Analysis_Predictive_Modeling.docx`: final report with code, outputs and plots (open to view)
+-  `Statistical_Analysis_Predictive_Modeling.pdf`: final report for viewing without download
+ ## Screenshot
+
+![RStudio workspace](workflow.png)
+Fig: Project running in RStudio on Posit Cloud, showing the Rmd file, data objects and knitted
+output
 
 ## How to run
 1. Open the `.Rmd` in RStudio or Posit Cloud.

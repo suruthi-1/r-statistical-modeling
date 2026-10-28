@@ -1,0 +1,484 @@
+---
+title: "Statistical Analysis and Predictive Modeling using R: Pima Indians Diabetes"
+author: "Suruthi D"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 5)
+```
+
+# 1. Setup and packages
+
+```{r packages}
+pkgs <- c("mlbench", "ggplot2", "dplyr", "tidyr", "caret",
+          "pROC", "corrplot", "randomForest")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+invisible(lapply(pkgs, library, character.only = TRUE))
+set.seed(123)
+```
+
+# 2. Dataset identification
+
+Dataset: `PimaIndiansDiabetes2` from the `mlbench` package (originally from the
+National Institute of Diabetes and Digestive and Kidney Diseases). It holds
+medical measurements for 768 women of Pima Indian heritage aged 21 or older.
+The target is `diabetes` (pos / neg).
+
+```{r load}
+df <- NULL
+
+# Try 1: from the mlbench package
+df <- tryCatch(mlbench::PimaIndiansDiabetes2, error = function(e) NULL)
+
+# Try 2: download the raw data if the package version fails
+if (is.null(df)) {
+  df <- tryCatch({
+    url <- "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
+    d <- read.csv(url, header = FALSE)
+    names(d) <- c("pregnant", "glucose", "pressure", "triceps",
+                  "insulin", "mass", "pedigree", "age", "diabetes")
+    d$diabetes <- factor(ifelse(d$diabetes == 1, "pos", "neg"),
+                         levels = c("neg", "pos"))
+    cols <- c("glucose", "pressure", "triceps", "insulin", "mass")
+    d[cols] <- lapply(d[cols], function(x) ifelse(x == 0, NA, x))
+    d
+  }, error = function(e) NULL)
+}
+
+if (is.null(df)) stop("Dataset could not be loaded. Install mlbench and restart R.")
+
+df <- as.data.frame(df)
+dim(df)
+str(df)
+head(df)
+```
+
+# 3. Exploratory statistical analysis
+
+## 3.1 Summary statistics and missing values
+
+```{r summary}
+summary(df)
+colSums(is.na(df))
+round(colMeans(is.na(df)) * 100, 1)   # % missing per column
+
+miss <- colSums(is.na(df))
+barplot(miss, las = 2, col = "steelblue",
+        main = "Missing values per variable", ylab = "Count")
+```
+
+## 3.2 Target balance
+
+```{r balance}
+table(df$diabetes)
+round(prop.table(table(df$diabetes)), 3)
+ggplot(df, aes(diabetes, fill = diabetes)) + geom_bar() +
+  labs(title = "Class distribution", x = "Diabetes", y = "Count") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+## 3.3 Distributions
+
+```{r distributions}
+long <- tidyr::pivot_longer(df, cols = -diabetes,
+                            names_to = "variable", values_to = "value")
+
+ggplot(long, aes(value, fill = diabetes)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity", na.rm = TRUE) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distribution of predictors by diabetes status") +
+  theme_minimal()
+
+ggplot(long, aes(diabetes, value, fill = diabetes)) +
+  geom_boxplot(na.rm = TRUE) +
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+## 3.4 Normality checks
+
+H0: the variable is normally distributed. H1: it is not.
+
+```{r normality}
+num_vars <- setdiff(names(df), "diabetes")
+
+normality <- sapply(num_vars, function(v) shapiro.test(na.omit(df[[v]]))$p.value)
+round(normality, 6)
+
+par(mfrow = c(2, 4))
+for (v in num_vars) {
+  qqnorm(df[[v]], main = paste("Q-Q plot:", v))
+  qqline(df[[v]], col = "red")
+}
+par(mfrow = c(1, 1))
+```
+
+Note: with n = 768 the Shapiro-Wilk test is very sensitive, so Q-Q plots
+should be read together with the p-values. Most variables are right-skewed,
+which supports using non-parametric tests alongside t-tests.
+
+## 3.5 Correlation analysis
+
+```{r correlation}
+num_df  <- df[, num_vars]
+cor_mat <- cor(num_df, use = "pairwise.complete.obs", method = "spearman")
+round(cor_mat, 2)
+corrplot(cor_mat, method = "color", type = "upper", addCoef.col = "black",
+         number.cex = 0.7, tl.col = "black")
+
+cor.test(df$glucose, df$insulin, method = "spearman", exact = FALSE)
+cor.test(df$age, df$pregnant, method = "spearman", exact = FALSE)
+```
+
+## 3.6 Hypothesis tests
+
+**Test 1: Is mean glucose different between diabetic and non-diabetic groups?**
+
+- H0: mean glucose (pos) = mean glucose (neg)
+- H1: mean glucose (pos) is different from mean glucose (neg)
+
+```{r ttest}
+t.test(glucose ~ diabetes, data = df)
+wilcox.test(glucose ~ diabetes, data = df, exact = FALSE)
+```
+
+**Test 2: The same comparison for every predictor (Wilcoxon rank-sum)**
+
+```{r wilcox-all}
+wil <- sapply(num_vars, function(v) {
+  wilcox.test(df[[v]] ~ df$diabetes, exact = FALSE)$p.value
+})
+wil_tbl <- data.frame(variable = num_vars,
+                      p_value = signif(wil, 3),
+                      p_adj_bonferroni = signif(p.adjust(wil, "bonferroni"), 3))
+wil_tbl[order(wil_tbl$p_value), ]
+```
+
+**Test 3: Is diabetes associated with age group? (Chi-square)**
+
+- H0: diabetes status is independent of age group
+- H1: diabetes status depends on age group
+
+```{r chisq}
+age_group <- cut(df$age, breaks = c(20, 30, 40, 50, Inf),
+                 labels = c("21-30", "31-40", "41-50", "51+"))
+tab <- table(age_group, df$diabetes)
+tab
+chisq.test(tab)
+round(prop.table(tab, 1), 3)
+```
+
+**Test 4: Variance check (Levene / Brown-Forsythe style test) for glucose**
+
+```{r levene}
+gl <- df[!is.na(df$glucose), ]
+gl$abs_dev <- abs(gl$glucose - ave(gl$glucose, gl$diabetes, FUN = median))
+anova(lm(abs_dev ~ diabetes, data = gl))
+```
+
+# 4. Model building
+
+## 4.1 Train / test split
+
+Missing values are imputed **inside** the cross-validation folds (median
+imputation via `preProcess`), which avoids data leakage.
+
+```{r split}
+set.seed(123)
+idx   <- createDataPartition(df$diabetes, p = 0.8, list = FALSE)
+train <- df[idx, ]
+test  <- df[-idx, ]
+dim(train); dim(test)
+round(prop.table(table(train$diabetes)), 3)
+round(prop.table(table(test$diabetes)), 3)
+```
+
+## 4.2 Cross-validation setup
+
+```{r control}
+ctrl <- trainControl(method = "cv", number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "final")
+# NOTE: for twoClassSummary the first factor level ("neg") is treated as the
+# event, so Sens/Spec in the CV table refer to "neg". ROC (AUC) is unaffected.
+```
+
+## 4.3 Model 1: Logistic regression
+
+```{r glm}
+set.seed(123)
+fit_glm <- train(diabetes ~ ., data = train,
+                 method = "glm", family = "binomial",
+                 metric = "ROC", trControl = ctrl,
+                 preProcess = c("medianImpute", "center", "scale"),
+                 na.action = na.pass)
+fit_glm
+summary(fit_glm$finalModel)
+```
+
+## 4.4 Model 2: Random forest (comparison model)
+
+```{r rf}
+set.seed(123)
+fit_rf <- train(diabetes ~ ., data = train,
+                method = "rf", metric = "ROC", trControl = ctrl,
+                tuneGrid = expand.grid(mtry = c(2, 4)),
+                ntree = 200,
+                preProcess = c("medianImpute"),
+                na.action = na.pass)
+fit_rf
+plot(fit_rf)
+```
+
+## 4.5 Cross-validated comparison
+
+```{r compare}
+res <- resamples(list(Logistic = fit_glm, RandomForest = fit_rf))
+summary(res)
+bwplot(res, metric = "ROC")
+```
+
+# 5. Evaluation on the held-out test set
+
+```{r test-eval}
+pred_glm <- predict(fit_glm, newdata = test, na.action = na.pass)
+prob_glm <- predict(fit_glm, newdata = test, type = "prob", na.action = na.pass)[, "pos"]
+cm_glm   <- confusionMatrix(pred_glm, test$diabetes, positive = "pos")
+cm_glm
+
+pred_rf <- predict(fit_rf, newdata = test, na.action = na.pass)
+prob_rf <- predict(fit_rf, newdata = test, type = "prob", na.action = na.pass)[, "pos"]
+cm_rf   <- confusionMatrix(pred_rf, test$diabetes, positive = "pos")
+cm_rf
+
+metrics <- data.frame(
+  Model       = c("Logistic", "RandomForest"),
+  Accuracy    = c(cm_glm$overall["Accuracy"],     cm_rf$overall["Accuracy"]),
+  Sensitivity = c(cm_glm$byClass["Sensitivity"],  cm_rf$byClass["Sensitivity"]),
+  Specificity = c(cm_glm$byClass["Specificity"],  cm_rf$byClass["Specificity"]),
+  Precision   = c(cm_glm$byClass["Precision"],    cm_rf$byClass["Precision"]),
+  F1          = c(cm_glm$byClass["F1"],           cm_rf$byClass["F1"])
+)
+metrics[, -1] <- round(metrics[, -1], 3)
+metrics
+```
+
+## 5.1 Confusion matrix plot
+
+```{r cm-plot}
+plot_cm <- function(cm, title) {
+  ggplot(as.data.frame(cm$table), aes(Reference, Prediction, fill = Freq)) +
+    geom_tile() + geom_text(aes(label = Freq), size = 6) +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    labs(title = title) + theme_minimal()
+}
+plot_cm(cm_glm, "Logistic regression: confusion matrix")
+plot_cm(cm_rf,  "Random forest: confusion matrix")
+```
+
+## 5.2 ROC curves and AUC
+
+```{r roc}
+roc_glm <- roc(test$diabetes, prob_glm, levels = c("neg", "pos"), direction = "<")
+roc_rf  <- roc(test$diabetes, prob_rf,  levels = c("neg", "pos"), direction = "<")
+auc(roc_glm); auc(roc_rf)
+
+plot(roc_glm, col = "blue", lwd = 2, main = "ROC curves (test set)")
+plot(roc_rf, col = "darkgreen", lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Logistic AUC =", round(auc(roc_glm), 3)),
+                  paste("RF AUC =", round(auc(roc_rf), 3))),
+       col = c("blue", "darkgreen"), lwd = 2)
+```
+
+# 6. Diagnostic analysis
+
+## 6.1 Logistic regression: odds ratios
+
+Predictors were standardized, so each odds ratio is per 1 standard deviation increase.
+
+```{r odds}
+glm_final <- fit_glm$finalModel
+ci <- exp(confint.default(glm_final))
+or_tbl <- data.frame(
+  term       = names(coef(glm_final)),
+  odds_ratio = round(exp(coef(glm_final)), 3),
+  CI_low     = round(ci[, 1], 3),
+  CI_high    = round(ci[, 2], 3),
+  p_value    = round(summary(glm_final)$coefficients[, 4], 4)
+)
+rownames(or_tbl) <- NULL
+or_tbl
+```
+
+## 6.2 Multicollinearity (VIF, computed manually)
+
+```{r vif}
+X <- model.matrix(glm_final)[, -1]
+vif_vals <- sapply(seq_len(ncol(X)), function(i) {
+  r2 <- summary(lm(X[, i] ~ X[, -i]))$r.squared
+  1 / (1 - r2)
+})
+names(vif_vals) <- colnames(X)
+round(vif_vals, 2)    # values above 5 suggest a problem
+```
+
+## 6.3 Residual diagnostics
+
+```{r residuals}
+par(mfrow = c(2, 2))
+plot(glm_final)
+par(mfrow = c(1, 1))
+
+res_df <- data.frame(fitted  = fitted(glm_final),
+                     dev_res = residuals(glm_final, type = "deviance"))
+ggplot(res_df, aes(fitted, dev_res)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE, colour = "red") +
+  labs(title = "Deviance residuals vs fitted probabilities",
+       x = "Fitted probability", y = "Deviance residual") +
+  theme_minimal()
+
+cd <- cooks.distance(glm_final)
+plot(cd, type = "h", main = "Cook's distance", ylab = "Cook's D")
+abline(h = 4 / length(cd), col = "red", lty = 2)
+sum(cd > 4 / length(cd))    # number of potentially influential points
+```
+
+## 6.4 Variable importance
+
+```{r varimp}
+plot(varImp(fit_glm), main = "Logistic regression: variable importance")
+plot(varImp(fit_rf),  main = "Random forest: variable importance")
+```
+
+# 7. Optimization and improvement
+
+## 7.1 Threshold tuning (improving sensitivity)
+
+```{r threshold}
+best <- coords(roc_glm, "best", best.method = "youden",
+               ret = c("threshold", "sensitivity", "specificity"))
+best
+
+thr <- as.numeric(best[["threshold"]][1])
+new_pred <- factor(ifelse(prob_glm >= thr, "pos", "neg"), levels = c("neg", "pos"))
+confusionMatrix(new_pred, test$diabetes, positive = "pos")
+```
+
+## 7.2 Other ideas to try
+
+- Better imputation (kNN or `mice`) instead of median imputation
+- Feature engineering (e.g. BMI categories, glucose x age interaction)
+- Class balancing (SMOTE or down-sampling) and tuning with a recall-focused metric
+- Other models: regularized logistic regression (glmnet), gradient boosting (xgboost), SVM
+- Repeated cross-validation for more stable estimates
+
+```{r values, include=FALSE}
+auc_glm  <- as.numeric(auc(roc_glm));  auc_rf  <- as.numeric(auc(roc_rf))
+acc_glm  <- as.numeric(cm_glm$overall["Accuracy"])
+acc_rf   <- as.numeric(cm_rf$overall["Accuracy"])
+sens_glm <- as.numeric(cm_glm$byClass["Sensitivity"])
+sens_rf  <- as.numeric(cm_rf$byClass["Sensitivity"])
+spec_glm <- as.numeric(cm_glm$byClass["Specificity"])
+spec_rf  <- as.numeric(cm_rf$byClass["Specificity"])
+baseline <- max(prop.table(table(test$diabetes)))
+best_model <- ifelse(auc_glm >= auc_rf, "logistic regression", "random forest")
+imp <- varImp(fit_glm)$importance
+top_feat <- rownames(imp)[order(-imp$Overall)][1:3]
+p_glucose <- t.test(glucose ~ diabetes, data = df)$p.value
+p_chisq   <- chisq.test(tab)$p.value
+sig_vars  <- wil_tbl$variable[wil_tbl$p_adj_bonferroni < 0.05]
+```
+
+# 8. Key Insights
+
+- **Group differences:** After Bonferroni correction, these predictors differed significantly between diabetic and non-diabetic patients: `r paste(sig_vars, collapse = ", ")`.
+- **Glucose:** The Welch t-test for glucose gave p = `r format.pval(p_glucose, digits = 3)`, so mean glucose differs between the two groups.
+- **Age and diabetes:** The chi-square test of age group vs diabetes gave p = `r format.pval(p_chisq, digits = 3)`.
+- **Model performance:** On the test set, logistic regression reached an accuracy of `r round(acc_glm, 3)` and AUC of `r round(auc_glm, 3)`; random forest reached an accuracy of `r round(acc_rf, 3)` and AUC of `r round(auc_rf, 3)`.
+- **Baseline comparison:** Always predicting the majority class would give an accuracy of `r round(baseline, 3)`, so the models should be judged against this number.
+- **Sensitivity vs specificity:** Logistic regression detected `r round(sens_glm * 100, 1)`% of diabetic cases (specificity `r round(spec_glm * 100, 1)`%); random forest detected `r round(sens_rf * 100, 1)`% (specificity `r round(spec_rf * 100, 1)`%).
+- **Best model by AUC:** `r best_model`.
+
+# 9. Key Features
+
+The three most important predictors in the logistic regression model were
+**`r top_feat[1]`**, **`r top_feat[2]`** and **`r top_feat[3]`**
+(see the variable importance plot in section 6.4). The table below summarizes all features used.
+
+```{r features, echo=FALSE}
+feat <- data.frame(
+  Feature = c("pregnant", "glucose", "pressure", "triceps", "insulin",
+              "mass", "pedigree", "age", "diabetes"),
+  Description = c("Number of times pregnant",
+                  "Plasma glucose concentration (2-hour oral glucose tolerance test)",
+                  "Diastolic blood pressure (mm Hg)",
+                  "Triceps skin fold thickness (mm)",
+                  "2-hour serum insulin (mu U/ml)",
+                  "Body mass index",
+                  "Diabetes pedigree function",
+                  "Age in years",
+                  "Target: pos / neg"),
+  Type = c(rep("Numeric predictor", 8), "Binary target")
+)
+knitr::kable(feat)
+```
+
+# 10. Conclusion
+
+This project analysed the Pima Indians Diabetes dataset using hypothesis tests,
+correlation and normality analysis, and two classification models evaluated with
+10-fold cross-validation and a held-out test set. The best-performing model by AUC
+was **`r best_model`**, with logistic regression reaching an AUC of
+`r round(auc_glm, 3)` and random forest `r round(auc_rf, 3)`.
+
+The statistical tests and the model importance scores point to the same group of
+key predictors (`r paste(top_feat, collapse = ", ")`), which supports the validity
+of the findings. The main limitations are the small sample size, median
+imputation of missing values, and moderate class imbalance. Future work could use
+multiple imputation, feature engineering, class balancing, threshold tuning and
+other algorithms such as gradient boosting.
+
+# Appendix
+
+## A. Data dictionary and source
+
+Dataset: `PimaIndiansDiabetes2` (R package `mlbench`), 768 observations,
+8 predictors and 1 binary target. Original source: National Institute of
+Diabetes and Digestive and Kidney Diseases.
+
+## B. Missing values per variable
+
+```{r appendix-missing}
+data.frame(Missing = colSums(is.na(df)),
+           Percent = round(colMeans(is.na(df)) * 100, 1))
+```
+
+## C. Full odds ratio table
+
+```{r appendix-or}
+knitr::kable(or_tbl)
+```
+
+## D. Test-set performance table
+
+```{r appendix-metrics}
+knitr::kable(metrics)
+```
+
+## E. Session information
+
+```{r session}
+sessionInfo()
+```
